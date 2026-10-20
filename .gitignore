@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+.vercel/
+supabase/.temp/
+
+# Generated and operating-system files
+.DS_Store
+*.tsbuildinfo
+/vite.config.js
+/vite.config.d.ts
