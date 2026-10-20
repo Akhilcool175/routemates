@@ -5,7 +5,7 @@ import {
   ShieldCheck, Users, X,
 } from 'lucide-react';
 import {
-  broadcastTripLocation, cancelRideRequest, cancelTrip, completeTrip, createRideRequest, createTrip,
+  relayTripLocation, cancelRideRequest, cancelTrip, completeTrip, createRideRequest, createTrip,
   loadTripLocationShareStates, loadTripMessages,
   loadAppData, loadOwnProfile, respondToRideRequest, signIn, signOut, signUp,
   sendTripMessage, setTripLocationSharing, updateOwnProfile, type AppData,
@@ -17,6 +17,7 @@ import { LiveLocationMap } from './components/LiveLocationMap';
 import { distanceKm, matchRoute, type RouteMatch } from './lib/routeMatching.mjs';
 import { validateTripForm } from './lib/tripValidation.mjs';
 import { isGoogleMapsConfigured, resolvePlaceId, type Coordinates, type PlaceValue } from './lib/places';
+import { createLocationShareGeneration } from './lib/locationShareLifecycle.mjs';
 
 type Page = 'Discover' | 'Create Trip' | 'My Trips' | 'Requests' | 'Profile';
 type Profile = { id: string; display_name: string; campus: string | null; created_at: string };
@@ -460,7 +461,7 @@ type WorkspaceProps = {
 };
 
 function Workspace(props: WorkspaceProps) {
-  const { mode, profile, email, trips, requests, dataState, dataError } = props;
+  const { mode, profile, email, trips, requests, dataState, dataError, onSignOut } = props;
   const [page, setPage] = useState<Page>('Discover');
   const [mobileMenu, setMobileMenu] = useState(false);
   const [toast, setToast] = useState('');
@@ -472,7 +473,16 @@ function Workspace(props: WorkspaceProps) {
   const [searchResults, setSearchResults] = useState<Array<{ trip: TripView; detail: MatchDetail }> | null>(null);
   const [searching, setSearching] = useState(false);
   const [chatTrip, setChatTrip] = useState<TripView | null>(null);
+  const chatStopRef = useRef<(() => Promise<void>) | null>(null);
   const timeout = useRef<number | undefined>(undefined);
+
+  const registerChatStop = useCallback((stop: (() => Promise<void>) | null) => {
+    chatStopRef.current = stop;
+  }, []);
+  const signOutWithLocationStop = useCallback(async () => {
+    await chatStopRef.current?.();
+    await onSignOut?.();
+  }, [onSignOut]);
 
   useEffect(() => () => { if (timeout.current) window.clearTimeout(timeout.current); }, []);
 
@@ -582,7 +592,7 @@ function Workspace(props: WorkspaceProps) {
       <div className="nav-caption">YOUR SPACE</div>
       <nav>{pages.map(({ name, icon: Icon }) => <button key={name} className={`nav-item ${page === name ? 'selected' : ''}`} onClick={() => changePage(name)}><Icon size={17}/>{name}{name === 'Requests' && <span className="nav-number">{pendingCount || '—'}</span>}{name === 'Create Trip' && <span className="nav-add"><Plus size={14}/></span>}</button>)}</nav>
       <div className="side-bottom"><div className="safety-note"><ShieldCheck size={17}/><div><strong>Ride thoughtfully</strong><p>Meet in public and keep someone in the loop.</p></div></div><div className="profile-small"><span className="user-avatar">{currentProfileLetter}</span><span><b>{profile.display_name}</b><small>{mode === 'demo' ? 'Fictional demo profile' : 'Self-reported profile'}</small></span><ChevronDown size={16}/></div></div>
-      <button className="side-signout" disabled={!props.onSignOut} onClick={() => props.onSignOut && void runAction('signout', async () => { await props.onSignOut?.(); return 'Signed out.'; })}>{mode === 'connected' ? <><LogOut size={15}/> Sign out</> : <><ShieldCheck size={15}/> Local demo</>}</button>
+      <button className="side-signout" disabled={!onSignOut} onClick={() => onSignOut && void runAction('signout', async () => { await signOutWithLocationStop(); return 'Signed out.'; })}>{mode === 'connected' ? <><LogOut size={15}/> Sign out</> : <><ShieldCheck size={15}/> Local demo</>}</button>
     </aside>
     {mobileMenu && <button className="scrim" onClick={() => setMobileMenu(false)} aria-label="Close menu"/>}
     <main className="main-area">
@@ -605,10 +615,10 @@ function Workspace(props: WorkspaceProps) {
       }}/>}
       {page === 'My Trips' && <MyTripsPage mode={mode} trips={trips.filter((trip) => trip.owned)} dataState={dataState} busyKey={busyKey} onCreate={() => changePage('Create Trip')} onCancel={(id) => void runAction(`cancel-trip-${id}`, () => props.onTripCancel(id))} onComplete={(id) => void runAction(`complete-trip-${id}`, () => props.onTripComplete(id))} onOpenChat={setChatTrip}/>}
       {page === 'Requests' && <RequestsPage requests={requests} dataState={dataState} busyKey={busyKey} mode={mode} onExplore={() => changePage('Discover')} onDecision={(id, decision) => void runAction(`decision-${id}`, () => props.onRequestDecision(id, decision))} onCancel={(id) => void runAction(`cancel-request-${id}`, () => props.onRequestCancel(id))} onOpenChat={setChatTrip}/>}
-      {page === 'Profile' && <ProfilePage mode={mode} profile={profile} email={email} onSave={props.onSaveProfile} onSignOut={props.onSignOut} notify={notify}/>}
+      {page === 'Profile' && <ProfilePage mode={mode} profile={profile} email={email} onSave={props.onSaveProfile} onSignOut={onSignOut ? signOutWithLocationStop : undefined} notify={notify}/>}
     </main>
     <nav className="mobile-tabs" aria-label="Main navigation">{pages.map(({ name, icon: Icon }) => <button key={name} className={page === name ? 'active' : ''} onClick={() => changePage(name)}><Icon size={18}/><span>{name === 'Create Trip' ? 'Create' : name === 'Discover' ? 'Explore' : name}</span></button>)}</nav>
-    {chatTrip && mode === 'connected' && <ChatPanel trip={chatTrip} onClose={() => setChatTrip(null)}/>}
+    {chatTrip && mode === 'connected' && <ChatPanel trip={chatTrip} onClose={() => setChatTrip(null)} onRegisterStop={registerChatStop}/>}
     {toast && <div className="toast" role="status"><span><Check size={15}/></span>{toast}<button onClick={() => setToast('')} aria-label="Dismiss"><X size={15}/></button></div>}
   </div>;
 }
@@ -814,7 +824,9 @@ function SentRequestRow({ request, busy, onCancel, onOpenChat }: { request: Requ
 
 type LivePoint = { key: string; label: string; coordinates: Coordinates; sentAt: number };
 
-function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
+function ChatPanel({ trip, onClose, onRegisterStop }: {
+  trip: TripView; onClose: () => void; onRegisterStop: (stop: (() => Promise<void>) | null) => void;
+}) {
   const [messages, setMessages] = useState<TripMessage[]>([]);
   const [shares, setShares] = useState<LocationShareState[]>([]);
   const [livePoints, setLivePoints] = useState<LivePoint[]>([]);
@@ -826,32 +838,79 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
   const [error, setError] = useState('');
   const [locationError, setLocationError] = useState('');
   const [success, setSuccess] = useState('');
+  const [tripEnded, setTripEnded] = useState(['cancelled', 'completed'].includes(trip.status));
   const scrollRef = useRef<HTMLDivElement>(null);
   const watchId = useRef<number | null>(null);
-  const heartbeatId = useRef<number | null>(null);
+  const locationRefreshId = useRef<number | null>(null);
+  const positionRequestPending = useRef(false);
+  const positionRequestKey = useRef<string | null>(null);
   const shareKeyRef = useRef<string | null>(null);
+  const activeShareKeysRef = useRef(new Set<string>());
+  const shareEventRevisionRef = useRef(0);
+  const sharesRef = useRef(shares);
+  const refreshingSharesRef = useRef(false);
+  const tripEndedRef = useRef(['cancelled', 'completed'].includes(trip.status));
+  sharesRef.current = shares;
   const lastSentAt = useRef(0);
   const lastSentPosition = useRef<Coordinates | null>(null);
   const mountedRef = useRef(true);
+  const startGenerationRef = useRef(createLocationShareGeneration());
+  const startWorkRef = useRef<Promise<void> | null>(null);
+  const startWorkGenerationRef = useRef<number | null>(null);
+  const pendingRelaysRef = useRef(new Set<Promise<void>>());
+
+  const sendLocation = useCallback((shareKey: string, coordinates: Coordinates) => {
+    const tracked = relayTripLocation(trip.id, shareKey, coordinates.lat, coordinates.lng);
+    pendingRelaysRef.current.add(tracked);
+    void tracked.then(
+      () => pendingRelaysRef.current.delete(tracked),
+      () => pendingRelaysRef.current.delete(tracked),
+    );
+    return tracked;
+  }, [trip.id]);
 
   const stopBrowserWatch = useCallback(() => {
     if (watchId.current !== null && navigator.geolocation) navigator.geolocation.clearWatch(watchId.current);
     watchId.current = null;
-    if (heartbeatId.current !== null) window.clearInterval(heartbeatId.current);
-    heartbeatId.current = null;
+    if (locationRefreshId.current !== null) window.clearInterval(locationRefreshId.current);
+    locationRefreshId.current = null;
+    positionRequestPending.current = false;
+    positionRequestKey.current = null;
     lastSentAt.current = 0;
     lastSentPosition.current = null;
   }, []);
 
   const stopSharing = useCallback(async (quiet = false) => {
+    startGenerationRef.current.invalidate();
+    if (mountedRef.current) setShareBusy(false);
     const oldKey = shareKeyRef.current;
+    const stateKey = oldKey ?? sharesRef.current.find((state) => state.isSelf)?.shareKey ?? null;
+    shareEventRevisionRef.current += 1;
     shareKeyRef.current = null;
     stopBrowserWatch();
-    if (oldKey) setLivePoints((old) => old.filter((point) => point.key !== oldKey));
+    if (stateKey) activeShareKeysRef.current.delete(stateKey);
+    if (stateKey) setLivePoints((old) => old.filter((point) => point.key !== stateKey));
     setShares((old) => old.map((state) => state.isSelf ? { ...state, isSharing: false, shareKey: null } : state));
-    try { await setTripLocationSharing(trip.id, false); }
-    catch (caught) { if (!quiet) setLocationError(errorText(caught)); }
+    const pendingStart = startWorkRef.current;
+    if (pendingStart) await pendingStart.catch(() => undefined);
+    await Promise.allSettled([...pendingRelaysRef.current]);
+    try {
+      await setTripLocationSharing(trip.id, false);
+      if (!quiet && mountedRef.current) setSuccess('The server confirmed location sharing is off.');
+    }
+    catch (caught) {
+      if (!quiet && mountedRef.current) {
+        setLocationError(`Sharing stopped on this device, but the server could not confirm revocation. The server lease expires within 30 seconds of its last accepted update. ${errorText(caught)}`);
+      }
+    }
   }, [stopBrowserWatch, trip.id]);
+
+  const currentStopRef = useRef(stopSharing);
+  currentStopRef.current = stopSharing;
+  useEffect(() => {
+    onRegisterStop(() => currentStopRef.current(true));
+    return () => onRegisterStop(null);
+  }, [onRegisterStop]);
 
   useEffect(() => {
     if (!supabase) {
@@ -862,6 +921,8 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
     let active = true;
     mountedRef.current = true;
     const client = supabase;
+    const startGeneration = startGenerationRef.current;
+    const pendingRelays = pendingRelaysRef.current;
     const refreshMessages = async () => {
       try {
         const rows = await loadTripMessages(trip.id);
@@ -871,11 +932,25 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
       }
     };
     const refreshShares = async () => {
+      if (refreshingSharesRef.current) return;
+      refreshingSharesRef.current = true;
+      const revision = shareEventRevisionRef.current;
       try {
         const values = await loadTripLocationShareStates(trip.id);
-        if (active) setShares(values);
+        if (!active || revision !== shareEventRevisionRef.current) return;
+        const activeKeys = new Set(values.flatMap((state) => state.isSharing && state.shareKey ? [state.shareKey] : []));
+        activeShareKeysRef.current = activeKeys;
+        setShares(values);
+        setLivePoints((old) => old.filter((point) => activeKeys.has(point.key)));
+        const own = values.find((state) => state.isSelf);
+        if (shareKeyRef.current && !own?.isSharing && Date.now() - lastSentAt.current >= 30_000) {
+          setLocationError('No fresh device location arrived before the share expired. Sharing has been stopped.');
+          void stopSharing(true);
+        }
       } catch (caught) {
         if (active) setLocationError(errorText(caught));
+      } finally {
+        refreshingSharesRef.current = false;
       }
     };
     void Promise.all([refreshMessages(), refreshShares()]).finally(() => { if (active) setLoading(false); });
@@ -887,29 +962,52 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
       const event = payload as Record<string, unknown>;
       const kind = event.kind;
       if (kind === 'trip_ended') {
+        startGenerationRef.current.invalidate();
+        tripEndedRef.current = true;
+        shareEventRevisionRef.current += 1;
+        setTripEnded(true);
+        setRealtimeReady(false);
         shareKeyRef.current = null;
         stopBrowserWatch();
+        activeShareKeysRef.current.clear();
         setShares((old) => old.map((state) => ({ ...state, isSharing: false, shareKey: null })));
         setLivePoints([]);
+        setShareBusy(false);
         setSuccess('Location sharing stopped because the trip ended.');
         return;
       }
+      if (tripEndedRef.current) return;
       const shareKey = typeof event.share_key === 'string' ? event.share_key : null;
       const displayName = typeof event.display_name === 'string' ? event.display_name : 'RouteMates member';
-      if (kind === 'sharing_status' && shareKey) {
+      if (kind === 'sharing_status') {
         const enabled = event.enabled === true;
+        shareEventRevisionRef.current += 1;
+        if (shareKey && enabled) activeShareKeysRef.current.add(shareKey);
+        if (shareKey && !enabled) activeShareKeysRef.current.delete(shareKey);
+        if (shareKey && !enabled && shareKeyRef.current === shareKey) {
+          shareKeyRef.current = null;
+          stopBrowserWatch();
+          setSuccess('Location sharing was stopped for this account.');
+        }
         setShares((old) => {
           const known = old.some((state) => state.shareKey === shareKey);
-          if (known) return old.map((state) => state.shareKey === shareKey ? { ...state, isSharing: enabled, shareKey: enabled ? shareKey : null } : state);
+          if (shareKey && known) return old.map((state) => state.shareKey === shareKey ? {
+            ...state, displayName, isSelf: state.isSelf || shareKey === shareKeyRef.current,
+            isSharing: enabled, shareKey: enabled ? shareKey : null,
+          } : state);
           if (!enabled) return old;
+          if (!shareKey) return old;
           return [...old, { displayName, isSelf: shareKey === shareKeyRef.current, isSharing: true, shareKey }];
         });
-        if (!enabled) setLivePoints((old) => old.filter((point) => point.key !== shareKey));
+        if (shareKey && !enabled) setLivePoints((old) => old.filter((point) => point.key !== shareKey));
         return;
       }
-      if (kind !== 'location' || !shareKey || typeof event.latitude !== 'number' || typeof event.longitude !== 'number' || typeof event.sent_at !== 'string') return;
+      if (kind !== 'location' || !shareKey || !activeShareKeysRef.current.has(shareKey)
+        || typeof event.latitude !== 'number' || !Number.isFinite(event.latitude) || event.latitude < -90 || event.latitude > 90
+        || typeof event.longitude !== 'number' || !Number.isFinite(event.longitude) || event.longitude < -180 || event.longitude > 180
+        || typeof event.sent_at !== 'string') return;
       const sentAt = Date.parse(event.sent_at);
-      if (!Number.isFinite(sentAt) || Date.now() - sentAt > 60_000) return;
+      if (!Number.isFinite(sentAt) || Date.now() - sentAt > 60_000 || sentAt - Date.now() > 5000) return;
       setLivePoints((old) => [...old.filter((point) => point.key !== shareKey), {
         key: shareKey, label: displayName,
         coordinates: { lat: event.latitude as number, lng: event.longitude as number }, sentAt,
@@ -926,17 +1024,30 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
     });
 
     const prune = window.setInterval(() => setLivePoints((old) => old.filter((point) => Date.now() - point.sentAt <= 60_000)), 5000);
+    const refreshShareTimer = window.setInterval(() => void refreshShares(), 15_000);
     const onVisibility = () => { if (document.visibilityState === 'hidden' && shareKeyRef.current) void stopSharing(true); };
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
       active = false;
       mountedRef.current = false;
       window.clearInterval(prune);
+      window.clearInterval(refreshShareTimer);
       document.removeEventListener('visibilitychange', onVisibility);
-      const wasSharing = Boolean(shareKeyRef.current);
+      const wasSharing = Boolean(shareKeyRef.current || sharesRef.current.some((state) => state.isSelf && state.isSharing));
+      startGeneration.invalidate();
+      shareEventRevisionRef.current += 1;
       shareKeyRef.current = null;
+      activeShareKeysRef.current.clear();
       stopBrowserWatch();
-      if (wasSharing) void setTripLocationSharing(trip.id, false);
+      const pendingStart = startWorkRef.current;
+      const relaysAtCleanup = [...pendingRelays];
+      if (wasSharing || pendingStart || relaysAtCleanup.length) {
+        void (async () => {
+          if (pendingStart) await pendingStart.catch(() => undefined);
+          await Promise.allSettled(relaysAtCleanup);
+          try { await setTripLocationSharing(trip.id, false); } catch { /* The 30-second server lease expires if cleanup cannot reach Supabase. */ }
+        })();
+      }
       void client.removeChannel(channel);
       void client.removeChannel(locationChannel);
     };
@@ -960,6 +1071,8 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
   };
 
   const startSharing = async () => {
+    if (tripEndedRef.current) return;
+    const generation = startGenerationRef.current.begin();
     setShareBusy(true);
     setLocationError('');
     setSuccess('');
@@ -973,66 +1086,116 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
       setShareBusy(false);
       return;
     }
-    navigator.geolocation.getCurrentPosition(async (position) => {
-      if (!mountedRef.current) return;
-      try {
-        const shareKey = await setTripLocationSharing(trip.id, true);
-        if (!shareKey) throw new Error('The database did not start a location share.');
-        if (!mountedRef.current) { await setTripLocationSharing(trip.id, false); return; }
-        shareKeyRef.current = shareKey;
-        const coordinates = { lat: position.coords.latitude, lng: position.coords.longitude };
-        lastSentAt.current = Date.now();
-        lastSentPosition.current = coordinates;
-        await broadcastTripLocation(trip.id, shareKey, coordinates.lat, coordinates.lng);
-        if (!mountedRef.current) { await setTripLocationSharing(trip.id, false); return; }
-        setShares((old) => {
-          const own = old.find((state) => state.isSelf);
-          if (own) return old.map((state) => state.isSelf ? { ...state, isSharing: true, shareKey } : state);
-          return [...old, { displayName: 'You', isSelf: true, isSharing: true, shareKey }];
-        });
-        watchId.current = navigator.geolocation.watchPosition((next) => {
-          const activeKey = shareKeyRef.current;
-          if (!activeKey) return;
-          const nextCoordinates = { lat: next.coords.latitude, lng: next.coords.longitude };
-          const elapsed = Date.now() - lastSentAt.current;
-          const moved = lastSentPosition.current ? distanceKm(lastSentPosition.current, nextCoordinates) ?? 0 : Infinity;
-          if (elapsed < 5000 || (moved < 0.015 && elapsed < 15000)) return;
+    navigator.geolocation.getCurrentPosition((position) => {
+      if (!mountedRef.current || tripEndedRef.current || !startGenerationRef.current.isCurrent(generation)) return;
+      const work = (async () => {
+        let shareKey: string | null = null;
+        try {
+          shareKey = await setTripLocationSharing(trip.id, true);
+          if (!shareKey) throw new Error('The database did not start a location share.');
+          if (!mountedRef.current || tripEndedRef.current || !startGenerationRef.current.isCurrent(generation)) {
+            await setTripLocationSharing(trip.id, false);
+            return;
+          }
+          shareEventRevisionRef.current += 1;
+          shareKeyRef.current = shareKey;
+          activeShareKeysRef.current.add(shareKey);
+          const coordinates = { lat: position.coords.latitude, lng: position.coords.longitude };
           lastSentAt.current = Date.now();
-          lastSentPosition.current = nextCoordinates;
-          void broadcastTripLocation(trip.id, activeKey, nextCoordinates.lat, nextCoordinates.lng).catch((caught: unknown) => {
-            if (mountedRef.current) setLocationError(errorText(caught));
-            shareKeyRef.current = null;
-            stopBrowserWatch();
+          lastSentPosition.current = coordinates;
+          await sendLocation(shareKey, coordinates);
+          if (!mountedRef.current || tripEndedRef.current || !startGenerationRef.current.isCurrent(generation)
+            || shareKeyRef.current !== shareKey) {
+            await setTripLocationSharing(trip.id, false);
+            return;
+          }
+          setShares((old) => {
+            const own = old.find((state) => state.isSelf || state.shareKey === shareKey);
+            if (own) return old.map((state) => state === own ? { ...state, isSelf: true, isSharing: true, shareKey } : state);
+            return [...old, { displayName: 'You', isSelf: true, isSharing: true, shareKey }];
           });
-        }, (geoError) => {
-          if (!mountedRef.current) return;
-          setLocationError(geoError.message || 'Your device could not read location.');
-          void stopSharing(true);
-        }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
-        heartbeatId.current = window.setInterval(() => {
-          const activeKey = shareKeyRef.current;
-          const coordinates = lastSentPosition.current;
-          if (!activeKey || !coordinates || Date.now() - lastSentAt.current < 12000) return;
-          lastSentAt.current = Date.now();
-          void broadcastTripLocation(trip.id, activeKey, coordinates.lat, coordinates.lng).catch((caught: unknown) => {
-            if (mountedRef.current) setLocationError(errorText(caught));
-            shareKeyRef.current = null;
-            stopBrowserWatch();
-          });
-        }, 4000);
-        setSuccess('Live location sharing is on for accepted trip participants.');
-      } catch (caught) {
-        if (mountedRef.current) {
-          setLocationError(errorText(caught));
-          await stopSharing(true);
-        } else {
+          watchId.current = navigator.geolocation.watchPosition((next) => {
+            const activeKey = shareKeyRef.current;
+            if (!activeKey) return;
+            const nextCoordinates = { lat: next.coords.latitude, lng: next.coords.longitude };
+            const elapsed = Date.now() - lastSentAt.current;
+            const moved = lastSentPosition.current ? distanceKm(lastSentPosition.current, nextCoordinates) ?? 0 : Infinity;
+            if (elapsed < 5000 || (moved < 0.015 && elapsed < 15000)) return;
+            lastSentAt.current = Date.now();
+            lastSentPosition.current = nextCoordinates;
+            void sendLocation(activeKey, nextCoordinates).catch((caught: unknown) => {
+              if (mountedRef.current) {
+                setLocationError(errorText(caught));
+                void stopSharing(true);
+              } else {
+                shareKeyRef.current = null;
+                stopBrowserWatch();
+              }
+            });
+          }, (geoError) => {
+            if (!mountedRef.current) return;
+            setLocationError(geoError.message || 'Your device could not read location.');
+            void stopSharing(true);
+          }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
+          locationRefreshId.current = window.setInterval(() => {
+            const activeKey = shareKeyRef.current;
+            if (!activeKey || positionRequestPending.current || Date.now() - lastSentAt.current < 15_000) return;
+            positionRequestPending.current = true;
+            positionRequestKey.current = activeKey;
+            navigator.geolocation.getCurrentPosition((freshPosition) => {
+              if (positionRequestKey.current === activeKey) {
+                positionRequestPending.current = false;
+                positionRequestKey.current = null;
+              }
+              if (!mountedRef.current || shareKeyRef.current !== activeKey || tripEndedRef.current) return;
+              if (Date.now() - freshPosition.timestamp > 10_000) {
+                setLocationError('Your device did not return a fresh position. Sharing has been stopped.');
+                void stopSharing(true);
+                return;
+              }
+              const freshCoordinates = { lat: freshPosition.coords.latitude, lng: freshPosition.coords.longitude };
+              lastSentAt.current = Date.now();
+              lastSentPosition.current = freshCoordinates;
+              void sendLocation(activeKey, freshCoordinates).catch((caught: unknown) => {
+                if (mountedRef.current) {
+                  setLocationError(errorText(caught));
+                  void stopSharing(true);
+                } else {
+                  shareKeyRef.current = null;
+                  stopBrowserWatch();
+                }
+              });
+            }, (geoError) => {
+              if (positionRequestKey.current === activeKey) {
+                positionRequestPending.current = false;
+                positionRequestKey.current = null;
+              }
+              if (!mountedRef.current || shareKeyRef.current !== activeKey) return;
+              setLocationError(geoError.message || 'Your device could not provide a fresh location. Sharing has been stopped.');
+              void stopSharing(true);
+            }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 12_000 });
+          }, 5000);
+          setSuccess('Live location sharing is on for accepted trip participants.');
+        } catch (caught) {
           shareKeyRef.current = null;
           stopBrowserWatch();
-          try { await setTripLocationSharing(trip.id, false); } catch { /* The server lease expires if cleanup cannot reach Supabase. */ }
+          activeShareKeysRef.current.delete(shareKey ?? '');
+          if (shareKey) setLivePoints((old) => old.filter((point) => point.key !== shareKey));
+          try { await setTripLocationSharing(trip.id, false); } catch { /* The 30-second server lease expires if cleanup cannot reach Supabase. */ }
+          if (mountedRef.current && startGenerationRef.current.isCurrent(generation)) setLocationError(errorText(caught));
+        } finally {
+          if (startWorkGenerationRef.current === generation) {
+            startWorkRef.current = null;
+            startWorkGenerationRef.current = null;
+          }
+          if (mountedRef.current && startGenerationRef.current.isCurrent(generation)) setShareBusy(false);
         }
-      } finally { if (mountedRef.current) setShareBusy(false); }
+      })();
+      startWorkRef.current = work;
+      startWorkGenerationRef.current = generation;
+      void work;
     }, (geoError) => {
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || !startGenerationRef.current.isCurrent(generation)) return;
       setLocationError(geoError.message || 'Location permission was denied. Chat still works without sharing.');
       setShareBusy(false);
     }, { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 });
@@ -1041,7 +1204,7 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
   const ownShare = shares.find((state) => state.isSelf);
   const isSharingHere = Boolean(shareKeyRef.current);
   const liveParticipants = shares.filter((state) => state.isSharing).map((state) => state.displayName);
-  const close = async () => { if (shareKeyRef.current) await stopSharing(true); onClose(); };
+  const close = async () => { if (shareKeyRef.current || ownShare?.isSharing) await stopSharing(true); onClose(); };
   const canSendMessage = ['open', 'full'].includes(trip.status);
 
   return <div className="dialog-scrim" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) void close(); }}>
@@ -1055,13 +1218,13 @@ function ChatPanel({ trip, onClose }: { trip: TripView; onClose: () => void }) {
             : <div className="chat-empty"><MessageCircle size={20}/><b>No messages yet</b><span>Coordinate a meeting point and travel details here.</span></div>}
       </div>
       <form className="chat-compose" onSubmit={(event) => void send(event)}><label htmlFor="trip-message">Message</label><textarea id="trip-message" value={body} maxLength={1000} rows={2} disabled={!canSendMessage} onChange={(event) => setBody(event.target.value)} placeholder={canSendMessage ? 'Write to accepted trip participants…' : 'Trip ended · conversation is read-only'}/><div className="chat-compose-footer"><small>{body.length}/1000{!canSendMessage && ' · Read-only after trip end'}</small><button className="black-button" disabled={sending || !body.trim() || !canSendMessage}>{sending ? 'Sending…' : 'Send'} <Send size={15}/></button></div></form>
-      <section className="location-sharing-panel"><div className="sharing-heading"><div><span className="eyebrow">OPTIONAL · DEVICE PERMISSION</span><h3>Live location</h3></div>{isSharingHere || ownShare?.isSharing ? <button className="stop-sharing" disabled={shareBusy} onClick={() => void stopSharing()}>{shareBusy ? 'Stopping…' : 'Stop sharing'}</button> : <button className="secondary-button" disabled={shareBusy || !realtimeReady} onClick={() => void startSharing()}>{shareBusy ? 'Starting…' : 'Share live location'}</button>}</div>
-        <p>Sharing is off unless you turn it on. It needs device permission and HTTPS (localhost is suitable for development). Chat remains available if permission is denied.</p>
+      <section className="location-sharing-panel"><div className="sharing-heading"><div><span className="eyebrow">OPTIONAL · DEVICE PERMISSION</span><h3>Live location</h3></div>{isSharingHere || ownShare?.isSharing ? <button className="stop-sharing" onClick={() => void stopSharing()} aria-label="Stop live location sharing">Stop sharing</button> : shareBusy ? <button className="secondary-button" onClick={() => void stopSharing()} aria-label="Cancel location sharing start">Cancel start</button> : <button className="secondary-button" disabled={!realtimeReady || tripEnded} onClick={() => void startSharing()}>Share live location</button>}</div>
+        <p>Sharing is off unless you turn it on. It needs device permission and HTTPS (localhost is suitable for development), and runs only while RouteMates stays open and visible. Chat remains available if permission is denied.</p>
         {(isSharingHere || ownShare?.isSharing) && <div className="sharing-live-note"><span className="online-dot"/>{isSharingHere ? 'You are sharing with accepted participants.' : 'A live-share session for this account is active; stop it here before leaving.'}</div>}
         {locationError && <div className="form-error" role="alert">{locationError}</div>}{success && <div className="form-success" role="status">{success}</div>}
         <div className="sharing-roster">{shares.map((state, index) => <span key={`${state.shareKey ?? state.displayName}-${index}`}><i className={state.isSharing ? 'sharing-dot' : ''}/>{state.isSelf ? 'You' : state.displayName}: {state.isSharing ? 'sharing' : 'not sharing'}</span>)}</div>
         <LiveLocationMap points={livePoints.map(({ key, label, coordinates }) => ({ key, label, coordinates }))}/>
-        <small className="location-privacy-note">Location points are sent only to the private trip channel, are not stored in RouteMates trip tables, and expire from this view after 60 seconds. Realtime may retain transient Broadcast events for up to 3 days.</small>
+        <small className="location-privacy-note">Only accepted trip participants can access live points. Coordinates are sent through Supabase Realtime's HTTP relay and are not inserted into Database Broadcast history. RouteMates stores only short-lived opt-in state and timestamps; points expire from this view after 60 seconds.</small>
         {liveParticipants.length > 0 && <span className="sr-only">Sharing: {liveParticipants.join(', ')}</span>}
       </section>
     </section>

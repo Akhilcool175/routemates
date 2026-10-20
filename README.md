@@ -40,11 +40,29 @@ Google recommends unique Places session tokens and browser-key restrictions; see
 ## Supabase setup and migrations
 
 1. Use the separate `routemates-test` Supabase project for testing. Enable Email Auth and sign-up. Set the Auth Site URL and allowed redirect URLs to the local origin, for example `http://localhost:5173`.
-2. The existing base migration is `supabase/migrations/20261018000100_create_routemates_tables.sql`. The app's original Auth, trip, and request workflows expect it to be applied.
-3. Review and apply the new additive migration manually, in order: `supabase/migrations/20261019000100_add_place_chat_location_sharing.sql`. It makes the legacy fare field nullable, adds place IDs, and creates chat/location-sharing tables, policies, and functions. This project never executes SQL automatically. Do not apply it to production for this prototype.
-4. Do not use a service-role key in the frontend. Authenticated API access remains subject to RLS and narrowly granted database functions.
+2. The base migration is `supabase/migrations/20261018000100_create_routemates_tables.sql`. The app's original Auth, trip, and request workflows expect it to be applied.
+3. Review and apply the additive migrations manually, in order: `supabase/migrations/20261019000100_add_place_chat_location_sharing.sql`, `supabase/migrations/20261021000100_expire_location_share_state.sql`, then `supabase/migrations/20261022000100_ephemeral_location_relay.sql`. The newest migration revokes the old coordinate RPC, blocks direct browser Broadcast writes, replaces share lifecycle functions, and adds server-only authorization plus scheduled cleanup. It clears existing ephemeral share rows but does not rewrite old Realtime message partitions.
+4. Deploy `supabase/functions/share-trip-location/` to the same TEST project after reviewing its source. `supabase/config.toml` keeps JWT verification enabled. The Edge runtime must provide the platform variables `SUPABASE_URL` and `SUPABASE_SECRET_KEYS`; the latter is server-only and must never be copied into Vite variables or browser code. `@supabase/server` reads the Supabase-injected keys. No service-role/secret key belongs in `.env.local`, Vercel frontend variables, or Git.
+5. Enable Supabase Cron (`pg_cron`) in Integrations > Cron, then add a recurring every-minute job with this command:
 
-The new migration has **not** been executed or runtime-validated by this task. It must be reviewed and manually applied before the updated frontend can load new trip columns or use chat/location features. The test plan is `supabase/tests/SECURITY_TEST_PLAN.md`.
+   ```sql
+   select public.cleanup_trip_location_shares();
+   ```
+
+   Use job name `routemates-location-share-cleanup` and schedule `* * * * *`. This scheduling step is manual; until it is configured, expired state is rejected by the relay but its non-coordinate metadata may remain in the share table.
+
+   SQL Editor alternative after enabling the extension (review and run manually):
+
+   ```sql
+   select cron.schedule(
+     'routemates-location-share-cleanup',
+     '* * * * *',
+     'select public.cleanup_trip_location_shares();'
+   );
+   ```
+6. In Supabase Realtime settings, disable **Allow public access**. Do not grant browser roles `INSERT` on `realtime.messages`. Never execute SQL or apply this migration automatically from the frontend.
+
+The new migrations have **not** been executed or runtime-validated by this task. Review and manually apply them to the test project, deploy the Edge Function, and configure Cron before testing sharing. The test plan is `supabase/tests/SECURITY_TEST_PLAN.md`.
 
 ## Places and route matching
 
@@ -57,9 +75,10 @@ The new migration has **not** been executed or runtime-validated by this task. I
 ## Trip chat and location sharing
 
 - Chat is available only to the trip host and accepted riders. Message identity/name is assigned from the authenticated user and profile. Message history remains readable after cancellation/completion; new messages stop when a trip becomes terminal.
-- Location sharing is separately opt-in for each accepted participant. It requires browser permission and HTTPS (localhost is suitable for development). A database function checks the opt-in and trip state on every coordinate send. Coordinates are broadcast on a participant-scoped private Realtime channel and are not stored in RouteMates trip/message tables. The app stops the watcher on opt-out, sign-out, page cleanup, hidden page, and trip end, and server-side opt-in leases expire after 30 seconds without updates.
-- Supabase Realtime Broadcast is transient but may retain event payloads for up to three days. Coordinate payloads contain precise location, so use fictional test accounts/devices and decide whether that retention is acceptable before enabling sharing.
-- Private topic authorization should be tested with **Allow public access** disabled in Supabase Realtime settings. Sharing/chat must be verified with multiple sessions; the UI and SQL alone do not prove authorization behavior.
+- Location sharing is separately opt-in for each accepted participant. It requires browser permission and HTTPS (localhost is suitable for development). Each update goes to the authenticated `share-trip-location` Edge Function, which derives actor identity from verified JWT claims and calls a service-role-only SQL authorization/rate-limit function. Coordinates are not passed to PostgreSQL. The function uses `channel.httpSend()` for a private Realtime REST Broadcast; the REST transport sends to connected clients without inserting the payload into `realtime.messages`. The app stops the watcher on opt-out, sign-out, pending-start cancellation, page cleanup, hidden page, GPS error, and trip end. The server lease expires after 30 seconds without a fresh position; stale markers are removed from the view after 60 seconds. Sharing runs only while RouteMates is open and visible; background GPS is not supported.
+- Current coordinates exist briefly in ChatPanel/Google Maps memory and transit Supabase's Realtime service for delivery. The application does not store coordinate history or log coordinates. REST Broadcast avoids Database Broadcast history, but provider-level operational logging/retention behavior was not verified and must not be treated as zero-retention. Older coordinates sent by the previous database Broadcast path may remain in `realtime.messages` until Supabase retention cleanup (up to about four days); the additive migration does not erase those earlier partitions.
+- RouteMates tables hold only each participant's enabled state, random share key, last update time, lease expiry, and change time. Explicit stop and trip termination delete share rows; the scheduled `cleanup_trip_location_shares()` job removes expired rows and disabled legacy metadata. If the user does not configure the Cron job, expired rows can persist even though the relay rejects their keys.
+- The live map passes current marker positions to the configured Google Maps JavaScript SDK; this task did not verify Google's provider-side handling. Use fictional test accounts/devices. Keep **Allow public access** disabled in Supabase Realtime settings and verify cross-account delivery, direct publish denial, Edge authentication, lease expiry, and Cron operation manually. The UI and SQL alone do not prove runtime behavior.
 
 ## Checks and two-account test
 
@@ -79,10 +98,11 @@ After reviewing/applying the migration to `routemates-test`:
 2. As Host A, create a future trip with two seats and a clear manually typed route or selected Places IDs.
 3. As Rider B, search the route. Try near, distant, reverse-direction, and text-only variants. Verify the match reason explains coordinate or lower-confidence text matching.
 4. As Rider B, request a seat. As Host A, accept it and confirm one seat remains. Reopen the trip in both sessions and send messages; verify a third pending/unrelated account cannot read or send.
-5. On both accepted-member devices, test location permission denial, opt-in, marker updates, and Stop Sharing. Test HTTPS preview or localhost. Try ending the trip while a share is active and verify it stops.
-6. Repeat the existing seat-capacity race with two riders and one seat in separate host sessions. Exactly one acceptance should succeed. This race has not been runtime-tested by this task.
-7. Remove all Supabase variables and restart Vite. Verify local fictional demo interactions remain available and the UI says demo mode. Restore credentials; a database failure must show an error rather than fake data.
+5. Review/apply the new location relay migration, deploy the `share-trip-location` Edge Function, and configure its required platform-managed runtime inputs (`SUPABASE_URL`, `SUPABASE_SECRET_KEYS`) without exposing them to the frontend. Enable the `pg_cron` extension and schedule `cleanup_trip_location_shares()` every minute.
+6. On both accepted-member devices, test location permission denial, opt-in, marker updates, Stop Sharing, cancellation while the browser permission prompt is open, direct client Broadcast denial, and cleanup after lease expiry. Test HTTPS preview or localhost. Try ending the trip while a share is active and verify it stops. Inspect Database Broadcast history for the test topic and verify precise new coordinates never appear there.
+7. Repeat the existing seat-capacity race with two riders and one seat in separate host sessions. Exactly one acceptance should succeed. This race has not been runtime-tested by this task.
+8. Remove all Supabase variables and restart Vite. Verify local fictional demo interactions remain available and the UI says demo mode. Restore credentials; a database failure must show an error rather than fake data.
 
 ## Prototype limitations
 
-The Google Maps key, Supabase settings, new migration, chat and live-location flows need manual configuration and multi-account verification. This work did not deploy the app, execute SQL, connect to Supabase, or test live GPS on separate HTTPS devices. No road route matching, payments, cab booking, identity/student verification, or public production launch is included. Account deletion remains blocked when accepted-request history exists under the base schema.
+The Google Maps key, Supabase settings, new migration, Edge Function, Cron job, chat and live-location flows need manual configuration and multi-account/device verification. The REST relay requires a Supabase Realtime server that supports `httpSend` (Realtime server v2.97.0 or later; this project has not been checked). This work did not deploy the app or function, execute SQL, connect to Supabase, or test live GPS on separate HTTPS devices. No road route matching, payments, cab booking, identity/student verification, or public production launch is included. Account deletion remains blocked when accepted-request history exists under the base schema.

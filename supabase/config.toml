@@ -1,0 +1,2 @@
+[functions.share-trip-location]
+verify_jwt = true

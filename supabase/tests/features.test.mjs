@@ -11,6 +11,11 @@ const locationInput = await readFile(new URL('src/components/LocationInput.tsx',
 const styles = await readFile(new URL('src/styles.css', root), 'utf8');
 const baseMigration = await readFile(new URL('supabase/migrations/20261018000100_create_routemates_tables.sql', root), 'utf8');
 const featureMigration = await readFile(new URL('supabase/migrations/20261019000100_add_place_chat_location_sharing.sql', root), 'utf8');
+const locationFixMigration = await readFile(new URL('supabase/migrations/20261021000100_expire_location_share_state.sql', root), 'utf8');
+const locationRelayMigration = await readFile(new URL('supabase/migrations/20261022000100_ephemeral_location_relay.sql', root), 'utf8');
+const locationRelayFunction = await readFile(new URL('supabase/functions/share-trip-location/index.ts', root), 'utf8');
+const locationRelayHelper = await readFile(new URL('supabase/functions/share-trip-location/relay.mjs', root), 'utf8');
+const lifecycleGuard = await readFile(new URL('src/lib/locationShareLifecycle.mjs', root), 'utf8');
 const testPlan = await readFile(new URL('supabase/tests/SECURITY_TEST_PLAN.md', root), 'utf8');
 
 test('place labels normalize case, whitespace, punctuation and stated aliases', () => {
@@ -184,20 +189,78 @@ test('chat writes derive sender identity and only accepted trip members can read
   assert.match(featureMigration, /status in \('open', 'full'\)/i);
 });
 
-test('private Realtime topics are participant scoped and location sends recheck opt-in per update', () => {
-  const broadcast = featureMigration.slice(featureMigration.indexOf('create function public.broadcast_trip_location'));
+test('private Realtime topics remain participant scoped and database broadcast cannot carry client GPS', () => {
   assert.match(featureMigration, /create policy "RouteMates participants read private trip channels"/i);
   assert.match(featureMigration, /public\.can_read_trip_realtime_topic\(realtime\.topic\(\), realtime\.messages\.extension\)/i);
   assert.match(featureMigration, /if v_match\[2\] = 'location' then[\s\S]*?v_trip_status is distinct from 'open'/i);
-  assert.match(featureMigration, /No authenticated INSERT policy is granted on realtime\.messages/i);
-  assert.match(broadcast, /v_share\.share_key is distinct from p_share_key/i);
-  assert.match(broadcast, /v_share\.expires_at <= v_now/i);
-  assert.match(broadcast, /last_broadcast_at > v_now - interval '3 seconds'/i);
-  assert.ok(broadcast.indexOf('from public.trips as t where t.id = p_trip_id for update')
-    < broadcast.indexOf('from public.trip_location_shares as s'));
+  assert.match(locationRelayMigration, /as restrictive for insert to anon, authenticated\s+with check \(false\)/i);
+  const relaySqlStatements = locationRelayMigration.replace(/^\s*--.*$/gm, '');
+  assert.doesNotMatch(relaySqlStatements, /(?:revoke|grant|alter table)\s+[^;]*realtime\.messages/i);
+  assert.match(locationRelayMigration, /revoke all on function public\.broadcast_trip_location[\s\S]*?from public, anon, authenticated, service_role/i);
+  assert.match(locationRelayMigration, /grant execute on function public\.authorize_trip_location_relay\(uuid, uuid, uuid\) to service_role/i);
+  assert.match(locationRelayMigration, /set search_path = ''/i);
+  const authorize = locationRelayMigration.slice(locationRelayMigration.indexOf('create or replace function public.authorize_trip_location_relay'), locationRelayMigration.indexOf('create or replace function public.get_trip_location_share_states'));
+  assert.match(authorize, /from public\.trips as t where t\.id = p_trip_id for update/i);
+  assert.ok(authorize.indexOf('for update') < authorize.indexOf('from public.trip_location_shares as s'));
+  assert.match(authorize, /r\.requester_id = p_actor_id and r\.status = 'accepted'/i);
+  assert.match(authorize, /v_share\.share_key is distinct from p_share_key/i);
+  assert.match(authorize, /v_share\.expires_at <= v_now/i);
+  assert.match(authorize, /last_broadcast_at > v_now - interval '3 seconds'/i);
+  assert.match(authorize, /expires_at = v_now \+ interval '30 seconds'/i);
+  assert.doesNotMatch(authorize, /p_latitude|p_longitude|realtime\.send/i);
+  assert.match(locationRelayFunction, /createSupabaseContext\(request, \{ auth: 'user' \}\)/);
+  assert.match(locationRelayFunction, /userClaims/);
+  assert.match(locationRelayFunction, /claims\?\.sub/);
+  assert.doesNotMatch(locationRelayFunction, /claims\?\.id/);
+  assert.match(locationRelayFunction, /authorize_trip_location_relay/);
+  assert.match(locationRelayFunction, /channel\.httpSend\(event, payload\)/);
+  assert.match(locationRelayFunction, /private: true/);
+  assert.match(locationRelayHelper, /latitude: input\.latitude/);
+  assert.match(locationRelayHelper, /longitude: input\.longitude/);
+  assert.match(locationRelayHelper, /new Set\(\['trip_id', 'share_key', 'latitude', 'longitude'\]\)/);
   assert.match(featureMigration, /expires_at > statement_timestamp\(\)/i);
-  assert.match(featureMigration, /set enabled = false, share_key = null, expires_at = null/i);
+  assert.match(locationRelayMigration, /delete from public\.trip_location_shares where trip_id = new\.id/i);
+  assert.match(locationRelayMigration, /delete from public\.trip_location_shares;\s*--/i);
+  assert.match(locationRelayMigration, /create or replace function public\.cleanup_trip_location_shares/i);
+  assert.match(locationRelayMigration, /'enabled', false, 'share_key', v_share\.share_key[\s\S]*?delete from public\.trip_location_shares;/i);
+  assert.match(locationRelayMigration, /for update of s skip locked/i);
+  const cleanupStart = locationRelayMigration.indexOf('create or replace function public.cleanup_trip_location_shares');
+  const cleanupEnd = locationRelayMigration.indexOf('revoke all on function public.cleanup_trip_location_shares', cleanupStart);
+  const cleanup = locationRelayMigration.slice(cleanupStart, cleanupEnd);
+  assert.match(cleanup, /where not s\.enabled or s\.expires_at is null/i);
+  assert.match(cleanup, /delete from public\.trip_location_shares/i);
+  assert.doesNotMatch(cleanup, /realtime\.send/i);
+  assert.match(locationFixMigration, /last_broadcast_at = null/i);
   assert.match(testPlan, /private Realtime|private trip channel/i);
+});
+
+test('Edge Function auth is explicit and the browser never calls the old coordinate RPC', async () => {
+  assert.match(await readFile(new URL('supabase/config.toml', root), 'utf8'), /verify_jwt\s*=\s*true/);
+  assert.match(await readFile(new URL('src/lib/routematesData.ts', root), 'utf8'), /functions\.invoke\('share-trip-location'/);
+  assert.doesNotMatch(await readFile(new URL('src/lib/routematesData.ts', root), 'utf8'), /rpc\('broadcast_trip_location'/);
+  assert.doesNotMatch(await readFile(new URL('src/lib/supabase.ts', root), 'utf8'), /broadcast_trip_location:/);
+  assert.match(lifecycleGuard, /isCurrent\(candidate\)/);
+});
+
+test('live location UI stops stale shares, filters revoked keys, and cleans up on sign-out', () => {
+  const chat = app.slice(app.indexOf('function ChatPanel'), app.indexOf('function ProfilePage'));
+  assert.match(chat, /navigator\.geolocation\.getCurrentPosition/);
+  assert.match(chat, /navigator\.geolocation\.watchPosition/);
+  assert.match(chat, /navigator\.geolocation\.clearWatch/);
+  assert.match(chat, /activeShareKeysRef\.current\.has\(shareKey\)/);
+  assert.match(chat, /activeShareKeysRef\.current\.delete\(shareKey\)/);
+  assert.match(chat, /refreshShareTimer/);
+  assert.match(chat, /tripEndedRef\.current = true/);
+  assert.match(chat, /document\.visibilityState === 'hidden'/);
+  assert.match(chat, /void stopSharing\(true\)/);
+  assert.match(chat, /Date\.now\(\) - lastSentAt\.current >= 30_000/);
+  assert.match(chat, /startGenerationRef\.current\.invalidate\(\)/);
+  assert.match(chat, /startGenerationRef\.current\.isCurrent\(generation\)/);
+  assert.match(chat, /await pendingStart\.catch/);
+  assert.doesNotMatch(chat, /broadcastTripLocation\(/);
+  assert.match(chat, /sendLocation\(activeKey/);
+  assert.match(app, /chatStopRef\.current\?\./);
+  assert.match(app, /await signOutWithLocationStop\(\)/);
 });
 
 test('message Realtime notification sends an opaque ID only; history RPC checks membership', () => {
@@ -212,4 +275,9 @@ test('test plan covers cross-account chat and consent-based location rejection c
   assert.match(testPlan, /Share live location/i);
   assert.match(testPlan, /Stop sharing/i);
   assert.match(testPlan, /expired|stale/i);
+  assert.match(testPlan, /another participant's key/i);
+  assert.match(testPlan, /Database Broadcast history/i);
+  assert.match(testPlan, /pg_cron/i);
+  assert.match(testPlan, /direct.*broadcast|broadcast.*direct/i);
+  assert.match(testPlan, /background GPS/i);
 });

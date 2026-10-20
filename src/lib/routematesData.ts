@@ -246,12 +246,9 @@ export async function setTripLocationSharing(tripId: string, enabled: boolean): 
   return data;
 }
 
-export async function broadcastTripLocation(tripId: string, shareKey: string, latitude: number, longitude: number): Promise<void> {
-  const { error } = await getClient().rpc('broadcast_trip_location', {
-    p_trip_id: tripId,
-    p_share_key: shareKey,
-    p_latitude: latitude,
-    p_longitude: longitude,
+export async function relayTripLocation(tripId: string, shareKey: string, latitude: number, longitude: number): Promise<void> {
+  const { error } = await getClient().functions.invoke('share-trip-location', {
+    body: { trip_id: tripId, share_key: shareKey, latitude, longitude },
   });
   throwIfError(error);
 }

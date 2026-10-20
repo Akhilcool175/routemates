@@ -163,7 +163,6 @@ export type Database = {
         Returns: { public_display_name: string; is_self: boolean; is_sharing: boolean; share_key: string | null }[];
       };
       set_trip_location_sharing: { Args: { p_trip_id: string; p_enabled: boolean }; Returns: string | null };
-      broadcast_trip_location: { Args: { p_trip_id: string; p_share_key: string; p_latitude: number; p_longitude: number }; Returns: undefined };
     };
     Enums: Record<string, never>;
     CompositeTypes: Record<string, never>;
