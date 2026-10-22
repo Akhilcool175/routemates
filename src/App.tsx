@@ -7,7 +7,7 @@ import {
 import {
   relayTripLocation, cancelRideRequest, cancelTrip, completeTrip, createRideRequest, createTrip,
   loadTripLocationShareStates, loadTripMessages,
-  loadAppData, loadOwnProfile, respondToRideRequest, signIn, signOut, signUp,
+  loadAppData, loadOwnProfile, respondToRideRequest, signOut,
   sendTripMessage, setTripLocationSharing, updateOwnProfile, type AppData,
   type LocationShareState, type NewTrip, type RequestView, type TripMessage, type TripView,
 } from './lib/routematesData';
@@ -91,7 +91,6 @@ function App() {
 
   const [session, setSession] = useState<{ user: { id: string; email?: string } } | null>(null);
   const [authLoading, setAuthLoading] = useState(isSupabaseConfigured);
-  const [authError, setAuthError] = useState('');
   const [profile, setProfile] = useState<Profile | null>(null);
   const [profileLoading, setProfileLoading] = useState(false);
   const [profileError, setProfileError] = useState('');
@@ -118,8 +117,7 @@ function App() {
         setDataError('');
       }
       setSession(nextSession ? { user: { id: nextSession.user.id, email: nextSession.user.email } } : null);
-      setAuthError('');
-      if (!nextSession) {
+        if (!nextSession) {
         setProfile(null);
         setTrips([]);
         setRequests([]);
@@ -127,15 +125,13 @@ function App() {
         setDataError('');
       }
     });
-    void supabase.auth.getSession().then(({ data, error }) => {
+    void supabase.auth.getSession().then(({ data }) => {
       if (!active) return;
-      if (error) setAuthError(error.message);
-      setSession(data.session ? { user: { id: data.session.user.id, email: data.session.user.email } } : null);
+        setSession(data.session ? { user: { id: data.session.user.id, email: data.session.user.email } } : null);
       setAuthLoading(false);
-    }).catch((error: unknown) => {
+    }).catch(() => {
       if (!active) return;
-      setAuthError(errorText(error));
-      setAuthLoading(false);
+        setAuthLoading(false);
     });
     return () => {
       active = false;
@@ -311,7 +307,24 @@ function App() {
   if (supabaseMode === 'incomplete' || supabaseMode === 'invalid') return <ConfigurationNotice/>;
   if (supabaseMode === 'configured' && authLoading) return <FullScreenStatus text="Checking your RouteMates session…"/>;
   if (supabaseMode === 'configured' && !session) {
-    return <AuthScreen initialError={authError}/>;
+    return <Workspace
+      mode="demo"
+      profile={demoUser}
+      email=""
+      trips={demoTrips}
+      requests={demoRequests}
+      dataState="ready"
+      dataError=""
+      onRetry={async () => null}
+      onCreateTrip={onCreateTrip}
+      onJoinTrip={onJoinTrip}
+      onRequestDecision={onRequestDecision}
+      onRequestCancel={onRequestCancel}
+      onTripCancel={onTripCancel}
+      onTripComplete={onTripComplete}
+      onSaveProfile={saveProfile}
+      onSignOut={undefined}
+    />;
   }
   if (supabaseMode === 'configured' && profileLoading) return <FullScreenStatus text="Loading your profile…"/>;
   if (supabaseMode === 'configured' && profileError) {
@@ -370,61 +383,6 @@ function ProfileLoadError({ message, onRetry, onSignOut }: { message: string; on
     try { await onSignOut(); } catch (caught) { setError(errorText(caught)); } finally { setBusy(false); }
   };
   return <div className="auth-page"><section className="auth-card"><Brand/><span className="overline">PROFILE CHECK</span><h1>We couldn’t load your profile</h1><p className="auth-message error">{message}</p>{error&&<p className="form-error">{error}</p>}<div className="auth-actions"><button className="black-button" onClick={onRetry}>Try again</button><button className="secondary-button" disabled={busy} onClick={runSignOut}>{busy?'Signing out…':'Sign out'}</button></div></section></div>;
-}
-
-function AuthScreen({ initialError }: { initialError: string }) {
-  const [view, setView] = useState<'sign-in' | 'sign-up'>('sign-in');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [displayName, setDisplayName] = useState('');
-  const [campus, setCampus] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState(initialError);
-  const [message, setMessage] = useState('');
-
-  const submit = async (event: FormEvent) => {
-    event.preventDefault();
-    setError('');
-    setMessage('');
-    if (view === 'sign-up' && displayName.trim().length < 2) {
-      setError('Enter a display name with at least two characters.');
-      return;
-    }
-    if (password.length < 6) {
-      setError('Password must be at least 6 characters.');
-      return;
-    }
-    setBusy(true);
-    try {
-      if (view === 'sign-up') {
-        const { data, error: authIssue } = await signUp(email, password, displayName, campus);
-        if (authIssue) throw authIssue;
-        if (!data.session) setMessage('Account created. Check your email if confirmation is enabled, then sign in here.');
-        else setMessage('Account created. Loading your profile…');
-      } else {
-        const { error: authIssue } = await signIn(email, password);
-        if (authIssue) throw authIssue;
-      }
-    } catch (caught) {
-      setError(errorText(caught));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  return <div className="auth-page"><section className="auth-card"><Brand/><span className="overline">SAME WAY. ONE RIDE.</span><h1>{view === 'sign-in' ? 'Welcome back' : 'Create your account'}</h1><p>{view === 'sign-in' ? 'Sign in to discover and coordinate shared rides.' : 'Create a profile to publish trips and request seats.'}</p>
-    <div className="mode-notice connected-notice"><i/> Supabase connected · sign in to continue</div>
-    <form className="auth-form" onSubmit={submit}>
-      {view === 'sign-up' && <><label>Display name<input autoComplete="name" value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={80} required placeholder="Name shown to other members"/></label><label>Campus or community <span className="optional">Optional · private</span><input value={campus} onChange={(event) => setCampus(event.target.value)} maxLength={120} placeholder="e.g. North Campus"/></label></>}
-      <label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required placeholder="you@example.com"/></label>
-      <label>Password<input type="password" autoComplete={view === 'sign-in' ? 'current-password' : 'new-password'} minLength={6} value={password} onChange={(event) => setPassword(event.target.value)} required placeholder="At least 6 characters"/></label>
-      {error && <div className="auth-message error"><CircleHelp size={15}/>{error}</div>}
-      {message && <div className="auth-message success"><Check size={15}/>{message}</div>}
-      <button className="black-button auth-submit" type="submit" disabled={busy}>{busy ? <><span className="spinner"/>Please wait…</> : <>{view === 'sign-in' ? 'Sign in' : 'Create account'} <ArrowRight size={16}/></>}</button>
-    </form>
-    <p className="auth-switch">{view === 'sign-in' ? 'New to RouteMates?' : 'Already have an account?'} <button onClick={() => { setView(view === 'sign-in' ? 'sign-up' : 'sign-in'); setError(''); setMessage(''); }}>{view === 'sign-in' ? 'Create an account' : 'Sign in'}</button></p>
-    <p className="auth-footnote">Display names are self-reported and unverified. RouteMates does not verify identity or student status.</p>
-  </section></div>;
 }
 
 function ProfileSetup({ onSave, onSignOut }: { onSave: (name: string, campus: string) => Promise<void>; onSignOut: () => Promise<void> }) {
